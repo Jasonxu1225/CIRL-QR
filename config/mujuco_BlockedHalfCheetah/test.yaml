@@ -30,7 +30,7 @@ running:
   store_by_game: False
 
 PPO:
-  policy_name: 'TwoCriticsMlpPolicy'
+  policy_name: 'DistributionalTwoCriticsMlpPolicy'
   learning_rate: 0.0003
   n_steps: 2048
   n_epochs: 10
@@ -50,7 +50,6 @@ PPO:
   shared_layers: null
   policy_layers: [64, 64]
   reward_vf_layers: [64, 64]
-  cost_vf_layers: [256, 256]
   batch_size: 64
   eval_every: 2048
   use_curiosity_driven_exploration: False
@@ -68,6 +67,13 @@ PPO:
   pid_delay: 1
   proportional_cost_ema_alpha: 0.5
   derivative_cost_ema_alpha: 0.5
+
+QRDQN:
+  N_quantiles: 64
+  cost_quantile: 48
+  tau_update: 0.01
+  LR_QN: 0.001
+  qnet_layers: [256, 256]
 
 CN:
   cn_learning_rate: 0.005

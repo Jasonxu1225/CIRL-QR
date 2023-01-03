@@ -389,6 +389,14 @@ class OnPolicyWithCostAlgorithm(BaseAlgorithm):
                 clipped_actions = np.clip(actions, self.action_space.low, self.action_space.high)
 
             new_obs, rewards, dones, infos = env.step(clipped_actions)  #  next step, get rewards(true)
+
+            # with th.no_grad():
+            #     # Convert to pytorch tensor
+            #     new_obs_tensor = th.as_tensor(self.new_bos).to(self.device)
+            #     new_actions, _1, _2, _3 = self.policy.forward(new_obs_tensor)
+            #
+            # new_actions = new_actions.cpu().numpy()
+
             orig_obs = env.get_original_obs() if isinstance(env, VecNormalize) else new_obs
             #  next step, get costs(true)
             if type(cost_function) is str:

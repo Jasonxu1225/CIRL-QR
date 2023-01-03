@@ -465,6 +465,7 @@ class RolloutBufferWithCost(BaseBuffer):
         self.generator_ready = False
         self.reset()
 
+
     def reset(self) -> None:
         self.observations = np.zeros((self.buffer_size, self.n_envs) + self.obs_shape, dtype=np.float32)
         self.new_observations = np.zeros((self.buffer_size, self.n_envs) + self.obs_shape, dtype=np.float32)

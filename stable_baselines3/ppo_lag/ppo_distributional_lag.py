@@ -3,6 +3,7 @@ from typing import Any, Callable, Dict, Optional, Type, Union
 import numpy as np
 import torch as th
 import torch
+import gym
 from gym import spaces
 from torch.nn import functional as F
 import random
@@ -224,8 +225,18 @@ class PPODistributionalLagrangian(OnPolicyWithCostAlgorithm):
 
                 # compute targets cost value
                 with torch.no_grad():
-                    _latent_pi, _latent_vf, _latent_cvf, _latent_sde = self.policy._get_latent(rollout_data.new_observations)
-                    distributional_cost_values_targets_next = self.policy.cost_value_net_target(_latent_cvf)
+                    #_latent_pi, _latent_vf, _latent_cvf, _latent_sde = self.policy._get_latent(rollout_data.new_observations)
+                    new_obs = rollout_data.new_observations
+                    new_features = self.policy.extract_features(new_obs)
+                    new_obs_tensor = th.as_tensor(new_obs).to(self.device)
+                    new_actions, _1, _2, _3 = self.policy.forward(new_obs_tensor)
+
+
+                if isinstance(self.action_space, gym.spaces.Discrete):
+                    # Reshape in case of discrete action
+                    new_actions = new_actions.reshape(-1, 1)
+                with torch.no_grad():
+                    distributional_cost_values_targets_next = self.policy.cost_value_net_target(th.cat([new_features, new_actions], dim=1))
 
                 distributional_cost_values_targets_next = distributional_cost_values_targets_next.unsqueeze(-1).transpose(1,2)
 
@@ -236,8 +247,9 @@ class PPODistributionalLagrangian(OnPolicyWithCostAlgorithm):
                     (self.cost_gamma * distributional_cost_values_targets_next.to(self.device) * (1 - dones.unsqueeze(-1)))
 
                 #compute local cost value
-                l_latent_pi, l_latent_vf, l_latent_cvf, l_latent_sde = self.policy._get_latent(rollout_data.observations)
-                distributional_cost_values_expected = self.policy.cost_value_net_local(l_latent_cvf)
+                #_latent_pi, _latent_vf, _latent_cvf, _latent_sde = self.policy._get_latent(rollout_data.new_observations)
+                features = self.policy.extract_features(rollout_data.observations)
+                distributional_cost_values_expected = self.policy.cost_value_net_local(th.cat([features, actions], dim=1))
                 distributional_cost_values_expected = distributional_cost_values_expected.unsqueeze(-1)
 
                 # compute loss

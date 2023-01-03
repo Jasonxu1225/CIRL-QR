@@ -597,7 +597,6 @@ class ActorCriticPolicy(BasePolicy):
         values = self.value_net(latent_vf)
         return values, log_prob, distribution.entropy()
 
-
 class ActorTwoCriticsPolicy(ActorCriticPolicy):
     """Implements the actor critic algorithm but with two value networks (for reward
     and cost)"""
@@ -620,7 +619,6 @@ class ActorTwoCriticsPolicy(ActorCriticPolicy):
         normalize_images: bool = True,
         optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
-        optimizer_QN_class: Type[th.optim.Optimizer] = th.optim.Adam,
     ):
         # Default network architecture, from stable-baselines
         if net_arch is None:
@@ -646,8 +644,196 @@ class ActorTwoCriticsPolicy(ActorCriticPolicy):
               features_extractor_kwargs,
               normalize_images,
               optimizer_class,
+              optimizer_kwargs
+        )
+
+    def _build_mlp_extractor(self) -> None:
+        """
+        Create the policy and value networks.
+        Part of the layers can be shared.
+        """
+        # Note: If net_arch is None and some features extractor is used,
+        #       net_arch here is an empty list and mlp_extractor does not
+        #       really contain any layers (acts like an identity module).
+        self.mlp_extractor = MlpExtractor(self.features_dim, net_arch=self.net_arch, activation_fn=self.activation_fn,
+                                          create_cvf=True)
+
+    def _build(self, lr_schedule: Callable[[float], float]) -> None:
+        """
+        Create the networks and the optimizer.
+        :param lr_schedule: Learning rate schedule
+            lr_schedule(1) is the initial learning rate
+        """
+        self._build_mlp_extractor()
+
+        latent_dim_pi = self.mlp_extractor.latent_dim_pi
+
+        # Separate feature extractor for gSDE
+        if self.sde_net_arch is not None:
+            self.sde_features_extractor, latent_sde_dim = create_sde_features_extractor(
+                self.features_dim, self.sde_net_arch, self.activation_fn
+            )
+
+        if isinstance(self.action_dist, DiagGaussianDistribution):
+            self.action_net, self.log_std = self.action_dist.proba_distribution_net(
+                latent_dim=latent_dim_pi, log_std_init=self.log_std_init
+            )
+        elif isinstance(self.action_dist, StateDependentNoiseDistribution):
+            latent_sde_dim = latent_dim_pi if self.sde_net_arch is None else latent_sde_dim
+            self.action_net, self.log_std = self.action_dist.proba_distribution_net(
+                latent_dim=latent_dim_pi, latent_sde_dim=latent_sde_dim, log_std_init=self.log_std_init
+            )
+        elif isinstance(self.action_dist, CategoricalDistribution):
+            self.action_net = self.action_dist.proba_distribution_net(latent_dim=latent_dim_pi)
+        elif isinstance(self.action_dist, MultiCategoricalDistribution):
+            self.action_net = self.action_dist.proba_distribution_net(latent_dim=latent_dim_pi)
+        elif isinstance(self.action_dist, BernoulliDistribution):
+            self.action_net = self.action_dist.proba_distribution_net(latent_dim=latent_dim_pi)
+        else:
+            raise NotImplementedError(f"Unsupported distribution '{self.action_dist}'.")
+
+        self.value_net = nn.Linear(self.mlp_extractor.latent_dim_vf, 1)
+        self.cost_value_net = nn.Linear(self.mlp_extractor.latent_dim_cvf, 1)
+        # Init weights: use orthogonal initialization
+        # with small initial weight for the output
+        if self.ortho_init:
+            # TODO: check for features_extractor
+            # Values from stable-baselines.
+            # feature_extractor/mlp values are
+            # originally from openai/baselines (default gains/init_scales).
+            module_gains = {
+                self.features_extractor: np.sqrt(2),
+                self.mlp_extractor: np.sqrt(2),
+                self.action_net: 0.01,
+                self.value_net: 1,
+                self.cost_value_net: 1,
+            }
+            for module, gain in module_gains.items():
+                module.apply(partial(self.init_weights, gain=gain))
+
+        # Setup optimizer with initial learning rate
+        self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
+
+    def forward(self, obs: th.Tensor, deterministic: bool = False) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+        """
+        Forward pass in all the networks (actor and critic)
+        :param obs: Observation
+        :param deterministic: Whether to sample or use deterministic actions
+        :return: action, value and log probability of the action
+        """
+        latent_pi, latent_vf, latent_cvf, latent_sde = self._get_latent(obs)
+        # Evaluate the values for the given observations
+        values = self.value_net(latent_vf)
+        cost_values = self.cost_value_net(latent_cvf)
+        distribution = self._get_action_dist_from_latent(latent_pi, latent_sde=latent_sde)
+        actions = distribution.get_actions(deterministic=deterministic)
+        log_prob = distribution.log_prob(actions)
+        return actions, values, cost_values, log_prob
+
+    def _get_latent(self, obs: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+        """
+        Get the latent code (i.e., activations of the last layer of each network)
+        for the different networks.
+        :param obs: Observation
+        :return: Latent codes
+            for the actor, the value function, the cost value function and for gSDE function
+        """
+        # Preprocess the observation if needed
+        features = self.extract_features(obs)
+        latent_pi, latent_vf, latent_cvf = self.mlp_extractor(features)
+
+        # Features for sde
+        latent_sde = latent_pi
+        if self.sde_features_extractor is not None:
+            latent_sde = self.sde_features_extractor(features)
+        return latent_pi, latent_vf, latent_cvf, latent_sde
+
+    def evaluate_actions(self, obs: th.Tensor, actions: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+        """
+        Evaluate actions according to the current policy,
+        given the observations.
+        :param obs:
+        :param actions:
+        :return: estimated value, cost value, log likelihood of taking those actions
+            and entropy of the action distribution.
+        """
+        latent_pi, latent_vf, latent_cvf, latent_sde = self._get_latent(obs)
+        distribution = self._get_action_dist_from_latent(latent_pi, latent_sde)
+        log_prob = distribution.log_prob(actions)
+        values = self.value_net(latent_vf)
+        cost_values = self.cost_value_net(latent_cvf)
+        return values, cost_values, log_prob, distribution.entropy()
+
+    def _predict(self, observation: th.Tensor, deterministic: bool = False) -> th.Tensor:
+        """
+        Get the action according to the policy for a given observation.
+        :param observation:
+        :param deterministic: Whether to use stochastic or deterministic actions
+        :return: Taken action according to the policy
+        """
+        latent_pi, _, _, latent_sde = self._get_latent(observation)
+        distribution = self._get_action_dist_from_latent(latent_pi, latent_sde)
+        return distribution.get_actions(deterministic=deterministic)
+
+
+class DistributionalActorTwoCriticsPolicy(ActorCriticPolicy):
+    """Implements the actor critic algorithm but with two value networks (for reward
+    and cost)"""
+    def __init__(
+        self,
+        observation_space: gym.spaces.Space,
+        action_space: gym.spaces.Space,
+        lr_schedule: Callable[[float], float],
+        net_arch: Optional[List[Union[int, Dict[str, List[int]]]]] = None,
+        activation_fn: Type[nn.Module] = nn.Tanh,
+        ortho_init: bool = True,
+        use_sde: bool = False,
+        log_std_init: float = 0.0,
+        full_std: bool = True,
+        sde_net_arch: Optional[List[int]] = None,
+        use_expln: bool = False,
+        squash_output: bool = False,
+        features_extractor_class: Type[BaseFeaturesExtractor] = FlattenExtractor,
+        features_extractor_kwargs: Optional[Dict[str, Any]] = None,
+        normalize_images: bool = True,
+        optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
+        optimizer_kwargs: Optional[Dict[str, Any]] = None,
+        N: int = 64,
+        cost_quantile:int = 48,
+        tau_update: float = 0.01,
+        LR_QN: float = 0.001,
+        qnet_layers: Optional[List[int]] = [256, 256],
+    ):
+        # Default network architecture, from stable-baselines
+        if net_arch is None:
+            if features_extractor_class == FlattenExtractor:
+                net_arch = [dict(pi=[64, 64], vf=[64, 64], cvf=[64,64])]
+            else:
+                net_arch = []
+
+        super(DistributionalActorTwoCriticsPolicy, self).__init__(
+              observation_space,
+              action_space,
+              lr_schedule,
+              net_arch,
+              activation_fn,
+              ortho_init,
+              use_sde,
+              log_std_init,
+              full_std,
+              sde_net_arch,
+              use_expln,
+              squash_output,
+              features_extractor_class,
+              features_extractor_kwargs,
+              normalize_images,
+              optimizer_class,
               optimizer_kwargs,
         )
+        self.cost_quantile = cost_quantile
+        self.dis_build(lr_schedule, N, tau_update, LR_QN, qnet_layers)
+
+
 
     def _build_mlp_extractor(self) -> None:
         """
@@ -682,22 +868,23 @@ class ActorTwoCriticsPolicy(ActorCriticPolicy):
         '''
         #  mlpextractor---------------------------------------------------------------------------------------------------------
         self.mlp_extractor = MlpExtractor(self.features_dim, net_arch=self.net_arch, activation_fn=self.activation_fn,
-                                          create_cvf=True)
+                                          create_cvf=False)
 
 
-    def _build(self, lr_schedule: Callable[[float], float]) -> None:
+    def dis_build(self, lr_schedule: Callable[[float], float], N, tau_update, LR_QN, qnet_layers) -> None:
         """
         Create the networks and the optimizer.
 
         :param lr_schedule: Learning rate schedule
             lr_schedule(1) is the initial learning rate
         """
+
         self._build_mlp_extractor()
-        self.N = 64
-        self.cost_quantile = 48
+        self.N = N
         self.quantile_tau = th.FloatTensor([i / self.N for i in range(1, self.N + 1)])
-        self.tau_update = 1e-2
-        self.LR_QN = 1e-3
+        self.tau_update = tau_update
+        self.LR_QN = LR_QN
+        self.qnet_layers = qnet_layers
 
         latent_dim_pi = self.mlp_extractor.latent_dim_pi
 
@@ -730,8 +917,19 @@ class ActorTwoCriticsPolicy(ActorCriticPolicy):
         self.value_net = nn.Linear(self.mlp_extractor.latent_dim_vf, 1)
         # cost net--------------------------------------------------------------------------------------------------------------
         # Linear(in_features=64, out_features=1, bias=True)
-        self.cost_value_net_target = nn.Linear(self.mlp_extractor.latent_dim_cvf, self.N)
-        self.cost_value_net_local = nn.Linear(self.mlp_extractor.latent_dim_cvf, self.N)
+
+        action_dim = get_action_dim(self.action_space)
+
+        q_net_target = create_mlp(self.features_dim + action_dim, self.N, self.qnet_layers)
+        self.cost_value_net_target = nn.Sequential(*q_net_target)
+
+        q_net_local = create_mlp(self.features_dim + action_dim, self.N, self.qnet_layers)
+        self.cost_value_net_local = nn.Sequential(*q_net_local)
+
+
+        # self.cost_value_net_target = nn.Linear(self.mlp_extractor.latent_dim_cvf, self.N)
+        # self.cost_value_net_local = nn.Linear(self.mlp_extractor.latent_dim_cvf, self.N)
+
         # Init weights: use orthogonal initialization
         # with small initial weight for the output
         if self.ortho_init:
@@ -763,19 +961,25 @@ class ActorTwoCriticsPolicy(ActorCriticPolicy):
         :param deterministic: Whether to sample or use deterministic actions
         :return: action, value and log probability of the action
         """
-        latent_pi, latent_vf, latent_cvf, latent_sde = self._get_latent(obs)
+        latent_pi, latent_vf, latent_sde = self._get_latent(obs)
+
         # Evaluate the values for the given observations
         values = self.value_net(latent_vf)
-        # cost_values = self.cost_value_net(latent_cvf)
-        with th.no_grad():
-            distributional_cost_values = self.cost_value_net_local(latent_cvf)
-            # Caculate the cost values using VaR method (75%)
-            cost_values = distributional_cost_values[:,self.cost_quantile-1].view(distributional_cost_values.shape[0], 1)
         # get actor distribution from action net
         distribution = self._get_action_dist_from_latent(latent_pi, latent_sde=latent_sde)
         # sample
         actions = distribution.get_actions(deterministic=deterministic)
         log_prob = distribution.log_prob(actions)
+
+        # cost_values = self.cost_value_net(feature+action)
+        features = self.extract_features(obs)
+        qvalue_input = th.cat([features, actions], dim=1)
+
+        with th.no_grad():
+            distributional_cost_values = self.cost_value_net_local(qvalue_input)
+            # Caculate the cost values using VaR method (75%)
+            cost_values = distributional_cost_values[:,self.cost_quantile-1].view(distributional_cost_values.shape[0], 1)
+
         return actions, values, cost_values, log_prob
 
     def _get_latent(self, obs: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
@@ -789,13 +993,13 @@ class ActorTwoCriticsPolicy(ActorCriticPolicy):
         """
         # Preprocess the observation if needed
         features = self.extract_features(obs)
-        latent_pi, latent_vf, latent_cvf = self.mlp_extractor(features)
+        latent_pi, latent_vf= self.mlp_extractor(features)
 
         # Features for sde
         latent_sde = latent_pi
         if self.sde_features_extractor is not None:
             latent_sde = self.sde_features_extractor(features)
-        return latent_pi, latent_vf, latent_cvf, latent_sde
+        return latent_pi, latent_vf, latent_sde
 
     def evaluate_actions(self, obs: th.Tensor, actions: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
@@ -807,13 +1011,17 @@ class ActorTwoCriticsPolicy(ActorCriticPolicy):
         :return: estimated value, cost value, log likelihood of taking those actions
             and entropy of the action distribution.
         """
-        latent_pi, latent_vf, latent_cvf, latent_sde = self._get_latent(obs)
+        latent_pi, latent_vf, latent_sde = self._get_latent(obs)
         distribution = self._get_action_dist_from_latent(latent_pi, latent_sde)
         log_prob = distribution.log_prob(actions)
         values = self.value_net(latent_vf)
-        #cost_values = self.cost_value_net(latent_cvf)
+        # cost_values = self.cost_value_net(feature+action)
+
+        features = self.extract_features(obs)
+        qvalue_input = th.cat([features, actions], dim=1)
+
         with th.no_grad():
-            distributional_cost_values = self.cost_value_net_local(latent_cvf)
+            distributional_cost_values = self.cost_value_net_local(qvalue_input)
             # Caculate the cost values using VaR method (75%)
             cost_values = distributional_cost_values[:,self.cost_quantile-1].view(distributional_cost_values.shape[0], 1)
         return values, cost_values, log_prob, distribution.entropy()
@@ -826,7 +1034,7 @@ class ActorTwoCriticsPolicy(ActorCriticPolicy):
         :param deterministic: Whether to use stochastic or deterministic actions
         :return: Taken action according to the policy
         """
-        latent_pi, _, _, latent_sde = self._get_latent(observation)
+        latent_pi, _, latent_sde = self._get_latent(observation)
         distribution = self._get_action_dist_from_latent(latent_pi, latent_sde)
         return distribution.get_actions(deterministic=deterministic)
 
@@ -841,7 +1049,6 @@ class ActorTwoCriticsPolicy(ActorCriticPolicy):
         """
         for target_param, local_param in zip(target_model.parameters(), local_model.parameters()):
             target_param.data.copy_(self.updata_tau * local_param.data + (1.0 - self.updata_tau) * target_param.data)
-
 
 
 class ActorCriticCnnPolicy(ActorCriticPolicy):
