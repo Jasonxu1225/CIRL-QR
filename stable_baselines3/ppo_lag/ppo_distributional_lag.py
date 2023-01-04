@@ -231,10 +231,10 @@ class PPODistributionalLagrangian(OnPolicyWithCostAlgorithm):
                     new_obs_tensor = th.as_tensor(new_obs).to(self.device)
                     new_actions, _1, _2, _3 = self.policy.forward(new_obs_tensor)
 
+                if isinstance(self.action_space, spaces.Discrete):
+                    # Convert discrete action from float to long
+                    new_actions = new_actions.long().flatten()
 
-                if isinstance(self.action_space, gym.spaces.Discrete):
-                    # Reshape in case of discrete action
-                    new_actions = new_actions.reshape(-1, 1)
                 with torch.no_grad():
                     distributional_cost_values_targets_next = self.policy.cost_value_net_target(th.cat([new_features, new_actions], dim=1))
 
@@ -248,7 +248,9 @@ class PPODistributionalLagrangian(OnPolicyWithCostAlgorithm):
 
                 #compute local cost value
                 #_latent_pi, _latent_vf, _latent_cvf, _latent_sde = self.policy._get_latent(rollout_data.new_observations)
-                features = self.policy.extract_features(rollout_data.observations)
+                with torch.no_grad():
+                    features = self.policy.extract_features(rollout_data.observations)
+
                 distributional_cost_values_expected = self.policy.cost_value_net_local(th.cat([features, actions], dim=1))
                 distributional_cost_values_expected = distributional_cost_values_expected.unsqueeze(-1)
 

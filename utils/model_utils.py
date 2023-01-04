@@ -190,7 +190,8 @@ def load_ppo_config(config, train_env, seed, log_file):
                               cost_quantile = config['QRDQN']['cost_quantile'],
                               tau_update = config['QRDQN']['tau_update'],
                               LR_QN = config['QRDQN']['LR_QN'],
-                              qnet_layers = config['QRDQN']['qnet_layers']),
+                              qnet_layers = config['QRDQN']['qnet_layers'],
+                              type = config['QRDQN']['type']),
     }
     if config["group"] == "PPO" or config["group"] == "GAIL":
         ppo_parameters.update({

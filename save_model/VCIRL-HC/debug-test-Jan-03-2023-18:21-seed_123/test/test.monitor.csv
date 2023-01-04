@@ -1,4 +1,0 @@
-#{"t_start": 1672741294.5873585, "env_id": "HCWithPos-v0"}
-reward,reward_nc,len,time,constraint
-274.36,274.36,1000,0.8,0
-235.18,235.18,1000,0.81,0

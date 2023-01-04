@@ -70,10 +70,11 @@ PPO:
 
 QRDQN:
   N_quantiles: 64
-  cost_quantile: 48
+  cost_quantile: 63
   tau_update: 0.01
   LR_QN: 0.001
   qnet_layers: [256, 256]
+  type: CVaR
 
 CN:
   cn_learning_rate: 0.005

@@ -803,6 +803,7 @@ class DistributionalActorTwoCriticsPolicy(ActorCriticPolicy):
         tau_update: float = 0.01,
         LR_QN: float = 0.001,
         qnet_layers: Optional[List[int]] = [256, 256],
+        type: str = 'VaR',
     ):
         # Default network architecture, from stable-baselines
         if net_arch is None:
@@ -831,6 +832,7 @@ class DistributionalActorTwoCriticsPolicy(ActorCriticPolicy):
               optimizer_kwargs,
         )
         self.cost_quantile = cost_quantile
+        self.type = type
         self.dis_build(lr_schedule, N, tau_update, LR_QN, qnet_layers)
 
 
@@ -977,8 +979,14 @@ class DistributionalActorTwoCriticsPolicy(ActorCriticPolicy):
 
         with th.no_grad():
             distributional_cost_values = self.cost_value_net_local(qvalue_input)
-            # Caculate the cost values using VaR method (75%)
-            cost_values = distributional_cost_values[:,self.cost_quantile-1].view(distributional_cost_values.shape[0], 1)
+            if self.type == 'VaR':
+                # Caculate the cost values using VaR method (75%)
+                cost_values = distributional_cost_values[:,self.cost_quantile-1].view(distributional_cost_values.shape[0], 1)
+            elif self.type == 'CVaR':
+                # Caculate the cost values using CVaR method (75%)
+                cost_values = distributional_cost_values[:,self.cost_quantile-1: self.N]
+                cost_values = th.mean(cost_values, dim=1)
+                cost_values = cost_values.view(distributional_cost_values.shape[0], 1)
 
         return actions, values, cost_values, log_prob
 
@@ -1022,8 +1030,17 @@ class DistributionalActorTwoCriticsPolicy(ActorCriticPolicy):
 
         with th.no_grad():
             distributional_cost_values = self.cost_value_net_local(qvalue_input)
-            # Caculate the cost values using VaR method (75%)
-            cost_values = distributional_cost_values[:,self.cost_quantile-1].view(distributional_cost_values.shape[0], 1)
+            # cost_values = distributional_cost_values[:,self.cost_quantile-1]
+            # cost_values = cost_values.view(distributional_cost_values.shape[0], 1)
+            if self.type == 'VaR':
+                # Caculate the cost values using VaR method (75%)
+                cost_values = distributional_cost_values[:,self.cost_quantile-1].view(distributional_cost_values.shape[0], 1)
+            elif self.type == 'CVaR':
+                # Caculate the cost values using CVaR method (75%)
+                cost_values = distributional_cost_values[:,self.cost_quantile-1: self.N]
+                cost_values = th.mean(cost_values, dim=1)
+                cost_values = cost_values.view(distributional_cost_values.shape[0], 1)
+
         return values, cost_values, log_prob, distribution.entropy()
 
     def _predict(self, observation: th.Tensor, deterministic: bool = False) -> th.Tensor:
